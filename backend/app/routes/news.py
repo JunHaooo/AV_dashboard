@@ -1,1 +1,0 @@
-# /api/news routes
