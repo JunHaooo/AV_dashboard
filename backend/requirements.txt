@@ -3,3 +3,6 @@ beautifulsoup4
 nltk
 requests
 lxml
+sentence-transformers
+keybert
+numpy

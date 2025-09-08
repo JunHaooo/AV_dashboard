@@ -6,240 +6,165 @@ import json
 import os
 import time
 import re
-import concurrent.futures
 from threading import Lock
+from sentence_transformers import SentenceTransformer, util
+from keybert import KeyBERT
+import numpy as np
 
-# ------------------------------- 
-# Configuration - MODIFY THESE TO SUIT YOUR NEEDS
-# ------------------------------- 
-seed_urls = [
-    "https://techcrunch.com/tag/autonomous-vehicles/",
-    "https://www.wired.com/tag/self-driving-cars/"
-]
+# -------------------------------
+# Configuration
+# -------------------------------
+seed_urls_file = "data/seeds.json"
+keywords_file = "data/keywords.json"
+summaries_file = "data/summaries.json"
 
-# SPEED CONTROLS - Adjust these for faster/slower crawling
-max_depth = 1  # REDUCED from 2 for faster testing - increase for deeper crawling
-crawl_delay = 0.2  # REDUCED from 1 second for faster crawling - increase to be more polite
-max_concurrent_requests = 3  # Number of simultaneous requests - increase for speed, decrease to be polite
-max_pages_per_run = 10  # LIMIT pages crawled per run for testing - set to None for unlimited
+max_depth = 2
+crawl_delay = 0.5
+max_pages_per_run = 20
+max_concurrent_requests = 3  # for future threading if needed
 
-# KEYWORD DISCOVERY SETTINGS
-auto_discover_keywords = True  # Set to False to disable automatic keyword discovery
-min_keyword_frequency = 2  # Minimum times a keyword must appear to be added
-keyword_discovery_patterns = [
-    r'\b(electric\s+vehicle[s]?)\b',
-    r'\b(autonomous\s+driving)\b',
-    r'\b(self\s*[-]?\s*driving)\b',
-    r'\b(artificial\s+intelligence)\b',
-    r'\b(machine\s+learning)\b',
-    r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:car|vehicle|auto))\b'
-]
+# AI settings
+semantic_threshold = 0.4  # similarity threshold for following links
+topic_text = "autonomous vehicles, self-driving cars, electric vehicles"  # main topic
 
-KEYWORDS_FILE = "data/keywords.json"
+# Thread lock
+lock = Lock()
 
-# Thread-safe lock for updating keyword counts
-keyword_lock = Lock()
+# -------------------------------
+# Load / Save JSON utilities
+# -------------------------------
+def load_json(filepath, default):
+    if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+        return default
+    with open(filepath, "r") as f:
+        return json.load(f)
 
-def load_keywords():
-    """Loads keywords from the JSON file as a simple list.
-    Returns a list of keywords and initializes internal counters.
-    """
-    default_keywords = ["autonomous", "self-driving", "av", "lidar", "tesla", "waymo", "evs", 
-                       "electric vehicle", "driverless", "autopilot", "robotaxi", "cruise"]
-    
-    if not os.path.exists(KEYWORDS_FILE) or os.path.getsize(KEYWORDS_FILE) == 0:
-        keywords_list = default_keywords
-        save_keywords(keywords_list)
-    else:
-        with open(KEYWORDS_FILE, 'r') as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            keywords_list = data
-        else:
-            # If it's an old format with counts, extract just the keywords
-            keywords_list = list(data.keys())
-            save_keywords(keywords_list)  # Convert to new format
-    
-    # Ensure default keywords are present
-    for kw in default_keywords:
-        if kw not in keywords_list:
-            keywords_list.append(kw)
-    
-    return keywords_list
+def save_json(filepath, data):
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
 
-def save_keywords(keywords_list):
-    """Saves the keywords list to the JSON file."""
-    os.makedirs(os.path.dirname(KEYWORDS_FILE), exist_ok=True)
-    with open(KEYWORDS_FILE, 'w') as f:
-        json.dump(keywords_list, f, indent=2)
+# -------------------------------
+# AI models initialization
+# -------------------------------
+print("🔧 Loading AI models...")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+topic_embedding = embedding_model.encode(topic_text)
+kw_model = KeyBERT()
 
-def discover_new_keywords(text, keywords_list, keyword_counts):
-    """Discovers new keywords from page content using pattern matching.
-    Returns updated keywords_list and keyword_counts with new keywords added.
-    """
-    if not auto_discover_keywords:
-        return keywords_list, keyword_counts
-        
-    discovered = {}
-    text_lower = text.lower()
-    
-    # Use predefined patterns to find potential keywords
-    for pattern in keyword_discovery_patterns:
-        matches = re.finditer(pattern, text, re.IGNORECASE)
-        for match in matches:
-            keyword = match.group(1).lower().strip()
-            if keyword and len(keyword) > 2:  # Skip very short keywords
-                discovered[keyword] = discovered.get(keyword, 0) + 1
-    
-    # Add discovered keywords that meet minimum frequency and aren't already tracked
-    with keyword_lock:
-        for keyword, freq in discovered.items():
-            if freq >= min_keyword_frequency and keyword not in keywords_list:
-                keywords_list.append(keyword)
-                keyword_counts[keyword] = freq
-                print(f"🔍 Discovered new keyword: '{keyword}' (frequency: {freq})")
-                # Save updated keywords list to file
-                save_keywords(keywords_list)
-    
-    return keywords_list, keyword_counts
+# -------------------------------
+# Helper functions
+# -------------------------------
+def extract_keywords(text, top_n=10):
+    """Extracts keywords from text using KeyBERT"""
+    return [kw[0].lower() for kw in kw_model.extract_keywords(text, keyphrase_ngram_range=(1,2), stop_words='english', top_n=top_n)]
 
-def crawl_single_page(url, depth, keywords_list, keyword_counts, visited):
-    """Crawls a single page and returns found links and updated keyword counts.
-    Thread-safe function for concurrent crawling.
-    """
-    if url in visited:
-        return [], keywords_list, keyword_counts
-    
-    try:
-        print(f"🕷️  Crawling ({depth}) -> {url}")
-        response = requests.get(url, timeout=10, headers={
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-        
-        if response.status_code != 200:
-            print(f"❌ Failed to crawl {url}: HTTP {response.status_code}")
-            return [], keywords_list, keyword_counts
+def semantic_similarity(text):
+    """Computes similarity between text and main topic"""
+    emb = embedding_model.encode(text)
+    sim = util.cos_sim(emb, topic_embedding)
+    return sim.item()
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        page_text = soup.get_text()
-        
-        # Discover new keywords from page content
-        keywords_list, keyword_counts = discover_new_keywords(page_text, keywords_list, keyword_counts)
-        
-        found_links = []
-        
-        # Collect and filter links
-        for link in soup.find_all("a", href=True):
-            href = urljoin(url, link["href"])
-            if urlparse(href).scheme in ["http", "https"]:
-                # Check if link contains any keywords (in URL or link text)
-                link_text = link.get_text().lower()
-                url_and_text = f"{href.lower()} {link_text}"
-                
-                for keyword in keywords_list:
-                    if keyword.lower() in url_and_text:
-                        with keyword_lock:
-                            keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
-                        found_links.append(href)
-                        print(f"✅ Found relevant link: {href[:80]}..." if len(href) > 80 else href)
-                        break  # Avoid multiple counts for the same link
+def summarize_text(text, n_sentences=3):
+    """Simple extractive summary using top TF-IDF-like sentences"""
+    sentences = re.split(r'(?<=[.!?]) +', text)
+    if len(sentences) <= n_sentences:
+        return text
+    # Compute simple score: sentence similarity to topic
+    scores = [semantic_similarity(s) for s in sentences]
+    top_idx = np.argsort(scores)[-n_sentences:]
+    summary = ' '.join([sentences[i] for i in sorted(top_idx)])
+    return summary
 
-        return found_links, keywords_list, keyword_counts
-
-    except Exception as e:
-        print(f"❌ Error crawling {url}: {e}")
-        return [], keywords_list, keyword_counts
-
-
-def crawl(seed_urls, keywords_list, max_depth=2):
-    """
-    Main crawling function using BFS with keyword filtering.
-    Returns found links and keyword counts.
-    """
-    keyword_counts = {kw: 0 for kw in keywords_list}  # Initialize counts
-    queue = deque([(url, 0) for url in seed_urls])  # (url, depth)
+# -------------------------------
+# Crawler
+# -------------------------------
+def crawl(seed_urls, max_depth=2, max_pages=None):
+    queue = deque([(url, 0) for url in seed_urls])
     visited = set()
-    found_links = []
+    discovered_domains = set(urlparse(u).netloc for u in seed_urls)
+    all_keywords = load_json(keywords_file, [])
+    summaries = load_json(summaries_file, {})
+
     pages_crawled = 0
 
-    while queue and (max_pages_per_run is None or pages_crawled < max_pages_per_run):
+    while queue and (max_pages is None or pages_crawled < max_pages):
         url, depth = queue.popleft()
         if url in visited or depth > max_depth:
             continue
-
-        print(f"🕷️ Crawling ({depth}) -> {url} (Queue size: {len(queue)})")
         visited.add(url)
-        found_links.append(url)
-        pages_crawled += 1
-
-        time.sleep(crawl_delay)
-
         try:
-            response = requests.get(url, timeout=10, headers={
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            })
-            if response.status_code != 200:
-                print(f"❌ Failed to crawl {url}: HTTP {response.status_code}")
+            print(f"🕷️ Crawling ({depth}) -> {url}")
+            r = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+            if r.status_code != 200:
+                print(f"❌ Failed: {r.status_code}")
                 continue
 
-            soup = BeautifulSoup(response.text, "html.parser")
-            page_text = soup.get_text()
-            
-            # Discover new keywords from page content
-            keywords_list, keyword_counts = discover_new_keywords(page_text, keywords_list, keyword_counts)
+            soup = BeautifulSoup(r.text, "html.parser")
+            page_text = soup.get_text(separator=' ', strip=True)
 
-            # Collect and filter links for next depth level
-            if depth < max_depth:
-                for link in soup.find_all("a", href=True):
-                    href = urljoin(url, link["href"])
-                    if urlparse(href).scheme in ["http", "https"] and href not in visited:
-                        # Check if link contains any keywords (in URL or link text)
-                        link_text = link.get_text().lower()
-                        url_and_text = f"{href.lower()} {link_text}"
-                        
-                        for keyword in keywords_list:
-                            if keyword.lower() in url_and_text:
-                                keyword_counts[keyword] = keyword_counts.get(keyword, 0) + 1
-                                queue.append((href, depth + 1))
-                                print(f"➕ Added to queue: {href[:60]}..." if len(href) > 60 else href)
-                                break  # Avoid multiple counts for the same link
+            # Semantic relevance check
+            sim = semantic_similarity(page_text)
+            if sim < semantic_threshold:
+                print(f"⚠️ Page not relevant (sim={sim:.2f})")
+                continue
+
+            # Extract keywords and update global list
+            kws = extract_keywords(page_text)
+            with lock:
+                new_kws = [k for k in kws if k not in all_keywords]
+                if new_kws:
+                    all_keywords.extend(new_kws)
+                    save_json(keywords_file, all_keywords)
+                    print(f"🔍 New keywords: {new_kws}")
+
+            # Generate summary
+            summary = summarize_text(page_text)
+            with lock:
+                summaries[url] = summary
+                save_json(summaries_file, summaries)
+                print(f"📝 Summary saved ({len(summary)} chars)")
+
+            # Extract links and decide which to follow
+            for link_tag in soup.find_all("a", href=True):
+                href = urljoin(url, link_tag["href"])
+                parsed = urlparse(href)
+                if parsed.scheme not in ["http", "https"]:
+                    continue
+                domain = parsed.netloc
+                link_text = link_tag.get_text(" ", strip=True)
+                combined_text = f"{link_text} {href}"
+
+                # Semantic check on link text
+                if semantic_similarity(combined_text) >= semantic_threshold:
+                    if domain not in discovered_domains:
+                        discovered_domains.add(domain)
+                        seed_urls.append(href)  # update seed list dynamically
+                    queue.append((href, depth + 1))
+
+            pages_crawled += 1
+            time.sleep(crawl_delay)
 
         except Exception as e:
             print(f"❌ Error crawling {url}: {e}")
+            continue
 
-    return found_links, keywords_list, keyword_counts
+    # Save updated seeds for next run
+    save_json(seed_urls_file, seed_urls)
+    print(f"🏁 Crawl finished. Pages crawled: {pages_crawled}, Keywords tracked: {len(all_keywords)}")
+    return visited, all_keywords, summaries
 
-
-# ------------------------------- 
-# Run
-# ------------------------------- 
-keywords_list = load_keywords()
-collected_links, updated_keywords, keyword_counts = crawl(seed_urls, keywords_list, max_depth=max_depth)
-
-# Save updated keywords list (only the list, not counts)
-save_keywords(updated_keywords)
-
-print("\n" + "="*60)
-print("📊 CRAWLING RESULTS")
-print("="*60)
-
-print(f"\n🔗 Visited Links ({len(collected_links)}):")
-for i, link in enumerate(collected_links, 1):
-    print(f"{i:2d}. {link}")
-
-print(f"\n🔍 Keywords Used ({len(updated_keywords)}):")
-for keyword in sorted(updated_keywords):
-    print(f"   • {keyword}")
-
-print(f"\n📈 Keyword Frequency (this session):")
-sorted_counts = sorted(keyword_counts.items(), key=lambda x: x[1], reverse=True)
-for keyword, count in sorted_counts:
-    if count > 0:
-        print(f"   {keyword}: {count}")
-
-print(f"\n⚙️  Crawl Settings:")
-print(f"   • Max depth: {max_depth}")
-print(f"   • Crawl delay: {crawl_delay}s")
-print(f"   • Max pages per run: {max_pages_per_run}")
-print(f"   • Auto-discover keywords: {auto_discover_keywords}")
-print("="*60)
+# -------------------------------
+# Main execution
+# -------------------------------
+if __name__ == "__main__":
+    print("🔧 Loading seeds...")
+    seed_urls = load_json(seed_urls_file, [
+        "https://techcrunch.com/tag/autonomous-vehicles/",
+        "https://www.wired.com/tag/self-driving-cars/"
+    ])
+    visited, keywords, summaries = crawl(seed_urls, max_depth=max_depth, max_pages=max_pages_per_run)
+    print("\n✅ Crawl completed.")
+    print(f"Pages visited: {len(visited)}")
+    print(f"Keywords discovered: {len(keywords)}")
+    print(f"Summaries saved for {len(summaries)} pages")
